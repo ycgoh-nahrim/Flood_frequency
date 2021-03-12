@@ -1,0 +1,926 @@
+---
+title: "Flood frequency analysis  <font size=5>v. 1.0</font>"
+author: "Water Resources Unit, NAHRIM"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: lumen
+    css: bootstrap.css
+    code_folding: hide
+    toc: true
+    toc_depth: 2
+    toc_float: true
+bibliography: references.bib
+link-citations: true
+params:
+  Station_No: 
+    label: "Station number"
+    input: text
+    value: "3116430"
+  Station_Name: 
+    label: "Station name"
+    input: text
+    value: "Sg Klang di Jambatan Sulaiman"
+  SF_filename: 
+    label: "Annual maximum series or daily peak flow in csv (Date, Flow) - Date format dd/mm/yyyy"
+    input: file
+    value: "OSU_peak.csv"
+  Water_year_month:
+    label: "Water year starts from month (if any, default is 1)"
+    input: numeric
+    value: 10
+    min: 1
+    max: 12
+    step: 1
+  Flood_AEP:
+    label: "Find Annual Exceedance Probability (AEP) or return period given flood value (m^3/s)"
+    input: numeric
+    value: 41971
+    min: 0
+  Data_source: 
+    label: "Data source"
+    input: text
+    value: "JPS"
+---
+
+<script>
+$(document).ready(function(){
+    $('[data-toggle="popover"]').popover(); 
+});
+</script>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning=FALSE, 
+                      message=FALSE,
+                      fig.align = 'center')
+```
+
+# Introduction
+
+This Rmarkdown interactive document was created for flood frequency analysis. 
+
+Most of the methods used in this analysis is in accordance with **Guidelines for Determining Flood Flow Frequency - Bulletin 17C ** by US Geological Survey [@england_jr_guidelines_2019]. 
+
+
+
+```{r input, warning=FALSE, message=FALSE, echo=FALSE}
+
+library(lfstat)
+library(tidyverse)
+library(lubridate)
+library(lmom)
+library(Metrics)
+library(smwrBase)
+
+library(ggplot2)
+library(plotly)
+library(scales)
+library(kableExtra)
+library(reactable)
+
+library(openxlsx)
+library(extrafont)
+
+###################
+#installation of USGS packages
+
+#remotes::install_github("USGS-R/smwrData")
+#remotes::install_github("USGS-R/smwrBase")
+
+# set strings as factors to false
+options(stringsAsFactors = FALSE)
+
+###################
+# INPUT DATA
+
+#streamflow data
+station_no <- params$Station_No
+station_name <- params$Station_Name
+
+#set filename
+filename2 <- paste0("FFA", station_no, "_", station_name)
+
+#station streamflow data path in working dir
+sf_filename <- params$SF_filename
+
+#water year, start month
+#if no water year, set 1 (Jan)
+water_yr_mth <- params$Water_year_month
+
+#flood value
+flood_value <- params$Flood_AEP
+
+
+#chart subtitle
+chart_subtitle <- paste0("Station ", station_no, ": ", station_name)
+
+#chart caption
+data_source <- params$Data_source
+chart_caption <- paste0("Data source: ", data_source)
+
+
+#version no
+version_no <- "Flood frequency analysis 1.0"
+
+
+#new directory to save output files
+#new_dir <- tempdir() #for shiny
+new_dir <- filename2  #for standalone rmd
+
+
+font_family <- "Roboto"
+
+
+#database file path (if any)
+#db_path <- "F:/Documents/2020/20200604_SF_PM/Data/SF_1d_avg/SF_1d_avg_PM_all_clean1.csv"
+db_path <- "C:/Users/user/Documents/GYC/FDC/Data/SF_1d_avg_PM_20200720_clean1.csv"
+
+
+
+```
+
+The streamflow station number is **`r station_no`**, **`r station_name`**.
+
+The source of data is from **`r data_source`**. 
+
+```{r working_dir, eval=TRUE}
+#set working directory if standalone rmd, false if shiny
+
+# get current working directory
+working_dir <- getwd()
+dir.create(filename2)
+setwd(filename2)
+
+
+#font
+#font_import(pattern="Roboto", prompt=FALSE)
+#windowsFonts(sans="Roboto")
+#loadfonts(device="win")
+#loadfonts(device="postscript")
+
+
+```
+
+
+```{r single_stn, eval=TRUE}
+
+#run this code if streamflow data is from single station
+###########################
+##OPTIONS (streamflow station data or from database) #############
+# peak annual/daily? flow data
+
+#input format in c(Date, Flow) in csv (case sensitive), station_no is station number, Flow in m3/s
+
+flowdata <- read.csv(file = paste0(sf_filename),
+                     #skip = 1,  #skip = 1 if csv from TIDEDA
+                     header = TRUE, sep=",") #depends on working dir
+
+```
+
+
+```{r database, eval=FALSE}
+
+#run this code if streamflow data is from database
+#from streamflow database
+
+flow_db <- read.csv(file = db_path, header = TRUE, sep=",")
+
+flowdata <- flow_db %>%
+  filter(Stn_no == station_no) %>% #check field name
+  select(Date, Flow) %>%
+  arrange(Date)
+
+```
+
+
+```{r prepare_data, warning=FALSE, message=FALSE, echo=FALSE}
+
+#rename columns
+colnames(flowdata)[1:2] <- c("Date", "Flow")
+
+#reformat columns
+flowdata$Date <- as.Date(flowdata$Date, format = "%d/%m/%Y")
+flowdata$Flow <- as.numeric(as.character(flowdata$Flow))
+
+
+#year with data
+year_w_data <- nrow(flowdata)
+
+
+# add columns for data aggregation
+## add a year column to data.frame
+flowdata <- flowdata %>%
+  mutate(year = year(Date))
+## add a month column to data.frame
+flowdata <- flowdata %>%
+  mutate(month = month(Date))
+## add a day column to data.frame
+flowdata <- flowdata %>%
+  mutate(day = day(Date))
+
+
+# CREATE LF OBJECT
+#rename column
+flowdata <- flowdata %>% 
+  rename(flow = "Flow")
+
+lf_data <- createlfobj(flowdata, 
+                       hyearstart = water_yr_mth, #start of hydrological year
+                       baseflow = T)
+
+# define data unit
+setlfunit("m^3/s")
+flowunit(lf_data) <- "m^3/s"
+
+#rename column back
+flowdata <- flowdata %>% 
+  rename(Flow = "flow")
+
+###################
+
+## select data
+flowdata_sel <- flowdata
+
+
+###################
+# Maximum annual flow
+
+#flowdata_sel_max <- flowdata_sel %>%
+#  group_by(year) %>%
+#  summarise(max_Q = max(Flow, na.rm = T),
+#            Max_date = Date[which.max(Flow)])
+
+flowdata_sel_max <- lf_data %>%
+  group_by(hyear) %>%
+  summarise(max_Q = max(flow, na.rm = T),
+            Max_date = year[which.max(flow)]) %>% 
+  rename(year = hyear)
+
+```
+
+
+```{r fit_distributions}
+
+#PLOTTING POSITION - WEIBULL
+#record length in years (n)
+n_yrs_min <- nrow(flowdata_sel_max)
+
+Q_pp <- flowdata_sel_max %>% 
+  arrange(-max_Q) %>%
+  mutate(rank = rank(-max_Q, ties.method= "first"), 
+         plot_p = rank/(n_yrs_min + 1),
+         ret_p = (n_yrs_min + 1)/rank) %>% # plotting position
+  rename(Year = year,
+         Q = max_Q)
+
+#vector of return periods
+rp <- c(2, 5, 10, 25, 50, 100, 200)
+
+#vector of distributions
+#selected distributions 
+dist_lf <- c("ln3", "pe3", "wei", "gev", "gum", "glo", "nor")
+
+
+#FITTING DISTRIBUTIONS
+#use lfstat for fitting distributions
+evfit.fxd <- evfit(flowdata_sel_max$max_Q, distribution = dist_lf,
+                   extreme = "maximum", zeta = 0) #so results same as hydrognomon
+
+
+q.evfit.fxd <- evquantile(evfit.fxd, return.period = rp)
+
+#extract quantile results
+qT.evfit.fxd <- data.frame(q.evfit.fxd[["T_Years_Event"]])
+qT.evfit.fxd <- as_data_frame(qT.evfit.fxd, rownames = "RP")
+qT.evfit.fxd$RP <- as.numeric(as.character(qT.evfit.fxd$RP))
+
+#extract parameters
+q.evfit.fxd.param <- q.evfit.fxd$parameters
+
+###################
+## Log-Pearson III
+
+
+# estimate moments
+moments = samlmu(Q_pp$Q, sort.data = TRUE)
+log.moments <- samlmu(log(Q_pp$Q), sort.data = TRUE )
+
+# estimate parameters
+parLPE3 <- pelpe3(log.moments) # log Pearson
+
+# estimate 1:100 yr event (0.01 probability)
+LogPE3 = exp(quape3(0.99, parLPE3))
+
+
+
+#extract parameters into list
+lpe3_param_list <- list(parLPE3[["mu"]], parLPE3[["sigma"]], parLPE3[["gamma"]])
+
+
+# add results to quantile table - package smwrBase
+qT.evfit.fxd <- qT.evfit.fxd %>%
+  mutate(lpe3 = qlpearsonIII((1-1/RP), 
+                             parLPE3[["mu"]], parLPE3[["sigma"]], parLPE3[["gamma"]]))
+
+
+```
+
+# Flood Frequency Curve
+
+```{r static_chart_ffc, fig.show = 'hide'}
+
+#COMPARISON OF ALL DISTRIBUTIONS IN PROBABILITY PLOT
+#for log axis
+breaks <- 10^(-10:10)
+minor_breaks <- rep(1:9, 21)*(10^rep(-10:10, each=9))
+
+
+# round y axis limit
+log_upper <- 10^(ceiling(log10(max(Q_pp$Q)*1.1)))
+log_lower <- 10^(floor(log10(min(Q_pp$Q)*0.9)))
+
+
+#chart
+#unable to change x-axis from non- exceedance to exceedance
+
+#log chart
+Q_prob_plot_log <- Q_pp %>%
+  ggplot(aes(x = (1-plot_p), y = Q)) +
+  geom_point(aes(x = (1-plot_p), y = Q, color = "Empirical"),
+             shape = 16, size = 1.5) +
+  stat_function(fun = qua_ev, args = list(distribution = "gev", 
+                                          para = q.evfit.fxd.param$gev), 
+                aes(color = "GEV (max) - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quaglo, args = list(unname(q.evfit.fxd.param$glo)), 
+                aes(color = "GLO"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = qua_ev, args = list(distribution = "gum", 
+                                          para = q.evfit.fxd.param$gum), 
+                aes(color = "Gumbel (EV I - max) - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = qualn3, args = list(unname(q.evfit.fxd.param$ln3)), 
+                aes(color = "Lognormal"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quape3, args = list(unname(q.evfit.fxd.param$pe3)), 
+                aes(color = "Pearson Type III"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quawei, args = list(unname(q.evfit.fxd.param$wei)), 
+                aes(color = "Weibull (EV III) - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quanor, args = list(unname(q.evfit.fxd.param$nor)), 
+                aes(color = "Normal - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  #stat_function(fun = quaLPE3, args = list(parLPE3), 
+  stat_function(fun = qlpearsonIII, args = lpe3_param_list, 
+                aes(color = "Log Pearson III"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  theme_bw(base_size = 10) +
+  scale_x_log10(
+    name = "Non-exceedance probability", 
+    breaks = breaks, minor_breaks = minor_breaks,
+    limits = c(0.01, 1),
+    sec.axis = sec_axis(trans = ~((1-.)*100), 
+                        name = "Annual Exceedance Probability, AEP (%)",
+                        breaks = c(99,98,95,90,80,70,60,50,20,1),
+                        labels = c(99,98,95,90,80,70,60,50,20,1)
+                        )
+  ) + 
+  scale_y_log10(name = bquote("Annual peak flow "~(m^3/s)), 
+                breaks = breaks, minor_breaks = minor_breaks,
+                limits = c(log_lower, log_upper), #adjust limits accordingly
+                labels = scales::number_format(accuracy = 1)
+  ) +
+  scale_colour_manual("Distributions",
+                      values = c("Empirical" = "black", 
+                                 "Pearson Type III" = "blue2",
+                                 "Log Pearson III" = "purple",
+                                 "Normal - LM" = "maroon3",
+                                 "Lognormal" = "orange", 
+                                 "Gumbel (EV I - max) - LM" = "magenta",
+                                 "GEV (max) - LM" = "red", 
+                                 "Weibull (EV III) - LM" = "cyan3",
+                                 "GLO" = "green3"
+                                 )) +
+  theme(text=element_text(family=font_family, 
+                          color="grey20", 
+                          size = 10),
+        axis.title = element_text(size = 8, colour = "gray35"),
+        legend.position = "right") +
+  labs(title = paste0("Flood frequency curve"),
+       subtitle = paste0(chart_subtitle),
+       caption = paste0(chart_caption))
+
+Q_prob_plot_log
+
+#print last plot to file
+ggsave(paste0(new_dir, "/", filename2, "_flood_freq_log.jpg"), dpi = 300,
+       width = 7.52, height = 4.56, units = "in")
+
+
+# y axis limit
+y_upper <- max(Q_pp$Q)*1.1
+y_lower <- min(Q_pp$Q)*0.9
+
+
+
+#normal chart
+Q_prob_plot <- Q_pp %>%
+  ggplot(aes(x = (1-plot_p), y = Q)) +
+  geom_point(aes(x = (1-plot_p), y = Q, color = "Empirical"),
+             shape = 16, size = 1.5) +
+  stat_function(fun = qua_ev, args = list(distribution = "gev", 
+                                          para = q.evfit.fxd.param$gev), 
+                aes(color = "GEV (max) - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quaglo, args = list(unname(q.evfit.fxd.param$glo)), 
+                aes(color = "GLO"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = qua_ev, args = list(distribution = "gum", 
+                                          para = q.evfit.fxd.param$gum), 
+                aes(color = "Gumbel (EV I - max) - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = qualn3, args = list(unname(q.evfit.fxd.param$ln3)), 
+                aes(color = "Lognormal"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quape3, args = list(unname(q.evfit.fxd.param$pe3)), 
+                aes(color = "Pearson Type III"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quawei, args = list(unname(q.evfit.fxd.param$wei)), 
+                aes(color = "Weibull (EV III) - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quanor, args = list(unname(q.evfit.fxd.param$nor)), 
+                aes(color = "Normal - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  #stat_function(fun = quaLPE3, args = list(parLPE3), 
+  stat_function(fun = qlpearsonIII, args = lpe3_param_list, 
+                aes(color = "Log Pearson III"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  theme_bw(base_size = 10) +
+  scale_x_log10(
+    name = "Non-exceedance probability", 
+    breaks = breaks, minor_breaks = minor_breaks,
+    limits = c(0.01, 1),
+    sec.axis = sec_axis(trans = ~((1-.)*100), 
+                        name = "Annual Exceedance Probability, AEP (%)",
+                        breaks = c(99,98,95,90,80,70,60,50,20,1),
+                        labels = c(99,98,95,90,80,70,60,50,20,1)
+    )
+  ) + 
+  scale_y_continuous(name = bquote("Annual peak flow "~(m^3/s)), 
+                     limits = c(y_lower, y_upper), #adjust limits accordingly
+                     labels = scales::number_format(accuracy = 1)
+  ) +
+  scale_colour_manual("Distributions",
+                      values = c("Empirical" = "black", 
+                                 "Pearson Type III" = "blue2",
+                                 "Log Pearson III" = "purple",
+                                 "Normal - LM" = "maroon3",
+                                 "Lognormal" = "orange", 
+                                 "Gumbel (EV I - max) - LM" = "magenta",
+                                 "GEV (max) - LM" = "red", 
+                                 "Weibull (EV III) - LM" = "cyan3",
+                                 "GLO" = "green3"
+                      )) +
+  theme(text=element_text(family=font_family, 
+                          color="grey20", 
+                          size = 10),
+        axis.title = element_text(size = 8, colour = "gray35"),
+        legend.position = "right") +
+  labs(title = paste0("Flood frequency curve"),
+       subtitle = paste0(chart_subtitle),
+       caption = paste0(chart_caption))
+
+Q_prob_plot
+
+
+#print last plot to file
+ggsave(paste0(new_dir, "/", filename2, "_flood_freq.jpg"), dpi = 300,
+       width = 7.52, height = 4.56, units = "in")
+
+```
+
+
+```{r interactive_chart_ffc}
+
+# plotly
+
+Q_prob_plotly <- Q_pp %>%
+  ggplot(aes(x = (1-plot_p), y = Q)) +
+  geom_point(aes(x = (1-plot_p), y = Q, color = "Empirical"),
+             shape = 16, size = 1.5) +
+  stat_function(fun = qualn3, args = list(unname(q.evfit.fxd.param$ln3)), 
+                aes(color = "Lognormal"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quape3, args = list(unname(q.evfit.fxd.param$pe3)), 
+                aes(color = "Pearson Type III"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quawei, args = list(unname(q.evfit.fxd.param$wei)), 
+                aes(color = "Weibull (EV III) - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = qua_ev, args = list(distribution = "gev", 
+                                          para = q.evfit.fxd.param$gev), 
+                aes(color = "GEV (max) - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = qua_ev, args = list(distribution = "gum", 
+                                          para = q.evfit.fxd.param$gum), 
+                aes(color = "Gumbel (EV I - max) - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quaglo, args = list(unname(q.evfit.fxd.param$glo)), 
+                aes(color = "GLO"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = quanor, args = list(unname(q.evfit.fxd.param$nor)), 
+                aes(color = "Normal - LM"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  stat_function(fun = qlpearsonIII, args = lpe3_param_list,
+                aes(color = "Log Pearson III"), show.legend = T,
+                size = 1, geom = "line", alpha = 0.5) +
+  theme_bw(base_size = 10) +
+  scale_x_log10(name = "Non-exceedance probability", 
+                limits = c(0.01, 1),
+                labels = scales::number_format(accuracy = 0.01)
+  ) + 
+  scale_y_log10(name = paste0("Annual peak flow  (m<sup>3</sup>/s)"), 
+                limits = c(log_lower, log_upper), #adjust limits accordingly
+                labels = scales::number_format(accuracy = 1)
+  ) +
+  scale_colour_manual("Distributions",
+                      values = c("Empirical" = "black", 
+                                 "Pearson Type III" = "blue2",
+                                 "Log Pearson III" = "purple",
+                                 "Normal - LM" = "maroon3",
+                                 "Lognormal" = "orange", 
+                                 "Gumbel (EV I - max) - LM" = "magenta",
+                                 "GEV (max) - LM" = "red", 
+                                 "Weibull (EV III) - LM" = "cyan3",
+                                 "GLO" = "green3")) +
+  theme(text=element_text(family=font_family, 
+                          color="grey20", 
+                          size = 12),
+        legend.position = "right") +
+  labs(title = paste0("Flood frequency curve"))
+
+
+
+ggplotly(Q_prob_plotly,
+         width = 800, height = 500) 
+
+```
+
+# Quantile-Quantile Plot
+
+```{r static_chart_qqplot, fig.show = 'hide'}
+
+#QQ PLOT
+
+#calculate quantiles
+
+qq_df <- Q_pp %>% 
+  mutate(pe3 = quape3(f=(1-plot_p), para= q.evfit.fxd.param$pe3),
+         #lpe3 = quaLPE3(f=(1-plot_p), para= parLPE3),
+         lpe3 = qlpearsonIII(p=(1-plot_p), parLPE3[["mu"]], parLPE3[["sigma"]], parLPE3[["gamma"]]),
+         nor = quanor(f=(1-plot_p), para= q.evfit.fxd.param$nor), 
+         ln3 = qualn3(f=(1-plot_p), para= q.evfit.fxd.param$ln3),
+         gum = qua_ev(distribution = "gum", f=(1-plot_p), para = q.evfit.fxd.param$gum),
+         gev = qua_ev(distribution = "gev", f=(1-plot_p), para = q.evfit.fxd.param$gev),
+         wei = quawei(f=(1-plot_p), para= q.evfit.fxd.param$wei),
+         glo = quaglo(f=(1-plot_p), para= q.evfit.fxd.param$glo))
+
+#pivot
+qq_df2 <- qq_df %>% 
+  pivot_longer(cols = -c(1:6),
+               names_to = "dist",
+               values_to = "theory_q") 
+#select columns
+qq_df2 <- qq_df2[,c(2,7:8)]
+
+#replace distribution names
+qq_df3 <- qq_df2 %>% 
+  mutate(dist2 = dist)
+qq_df3 <- qq_df3 %>% 
+  mutate(dist2 = replace(dist2, dist == "pe3", "Pearson Type III"),
+         dist2 = replace(dist2, dist == "lpe3", "Log Pearson III"),
+         dist2 = replace(dist2, dist == "nor", "Normal - LM"),
+         dist2 = replace(dist2, dist == "ln3", "Lognormal"),
+         dist2 = replace(dist2, dist == "gum", "Gumbel (EV I - max) - LM"),
+         dist2 = replace(dist2, dist == "gev", "GEV (max) - LM"),
+         dist2 = replace(dist2, dist == "wei", "Weibull (EV III) - LM"),
+         dist2 = replace(dist2, dist == "glo", "GLO"))
+         
+         
+
+#chart
+Q_QQ_plot <- qq_df3 %>%
+  ggplot() +
+  geom_point(aes(x = theory_q, y = Q, color = dist2,
+                 text = paste0("Distribution: ", dist2,
+                               "<br>Empirical quantile: ", sprintf("%0.1f", Q),
+                               " m<sup>3</sup>/s<br>Theoretical quantile: ",
+                               sprintf("%0.1f", theory_q),
+                               " m<sup>3</sup>/s")),
+             shape = 16, size = 1.5, alpha = 0.7) +
+  geom_abline(intercept = 0, slope = 1) +
+  theme_bw(base_size = 10) +
+  scale_x_continuous(name = "Theoretical quantiles",
+                     labels = comma,
+                     limits = c(0, NA)
+  ) + #x axis format
+  scale_y_continuous(name = "Empirical quantiles",
+                     labels = comma,
+                     limits = c(0, NA) #adjust limits accordingly
+  ) +
+  scale_colour_manual("Distributions",
+                      values = c("Empirical" = "black", 
+                                 "Pearson Type III" = "blue2",
+                                 "Log Pearson III" = "purple",
+                                 "Normal - LM" = "maroon3",
+                                 "Lognormal" = "orange", 
+                                 "Gumbel (EV I - max) - LM" = "magenta",
+                                 "GEV (max) - LM" = "red", 
+                                 "Weibull (EV III) - LM" = "cyan3",
+                                 "GLO" = "green3")) +
+  theme(text=element_text(family=font_family, 
+                          color="grey20", 
+                          size = 10),
+        axis.title = element_text(size = 8, colour = "gray35"),
+        legend.position = "right") +
+  labs(title = paste0("Quantile-quantile plot for annual peak flow"),
+       subtitle = paste0(chart_subtitle),
+       caption = paste0(chart_caption))
+
+Q_QQ_plot
+
+##print last plot to file
+ggsave(paste0(new_dir, "/", filename2, "_QQplot.jpg"), dpi = 300,
+       width = 7.52, height = 4.56, units = "in")
+
+```
+
+
+```{r interactive_chart_qqplot}
+
+ggplotly(Q_QQ_plot,
+         width = 800, height = 500) 
+
+```
+\newpage
+
+# Evaluation
+
+The results of the fit are evaluated using **Root Mean Square Error (RMSE)** to select the best probability distribution.
+
+Rank the results by clicking on 'RMSE' column header.
+
+
+```{r evaluation}
+
+#EVALUATION
+rmse_all <- qq_df3 %>% 
+  group_by(dist2) %>% 
+  summarise(RMSE = rmse(Q, theory_q))
+
+
+#interactive table
+#goodness-of-fit (RMSE)
+reactable(rmse_all, 
+          highlight = TRUE, striped = TRUE,
+          columns = list(dist2 = colDef(name = "Distribution", align = "left"),
+                         RMSE = colDef(align = "right", format = colFormat(digits = 2))))
+
+
+```
+
+# Quantile Estimation
+
+```{r quantile_estimation}
+
+#interactive table for quantile estimation
+
+qT.evfit.fxd2 <- qT.evfit.fxd %>% 
+  mutate(AEP = 1/RP*100)
+
+qT.evfit.fxd3 <- qT.evfit.fxd2[,c(1,10,2:9)]
+
+qT.evfit.fxd3 %>% 
+  mutate_if(is.numeric, round, digits = 1) %>% 
+  mutate_all(~cell_spec(., "html", 
+                        popover = spec_popover(content = paste0(qT.evfit.fxd3$RP, 
+                                                                "-year flood value of ", .,
+                                                                " m^3/s has a ", qT.evfit.fxd3$AEP,
+                                                                "% chance of occuring in a single year"),
+                                               title = NULL,  # title will add a Title Panel on top
+                                               position = "right"
+                        ),
+                        color = ifelse(. < 0, "red"," black"))) %>%
+  kable(digits = c(0,0,1,1,1,1,1,1,1,1), escape = F, format = "html", align = "r",
+        format.args = list(big.mark = ","), #thousand separator, not working
+        col.names = c("Return Period","AEP (%)","Lognormal", "Pearson Type III", "Weibull (EV III) - LM",
+                      "GEV (max) - LM", "Gumbel (EV I - max) - LM", "GLO", "Normal - LM", "Log Pearson III")) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = T) %>%
+  column_spec(1:2, bold = T, background = "gray80") %>% 
+  column_spec(3:10, width = "3cm")
+
+
+```
+
+# AEP for given Flood
+
+The table below shows the **Annual Exceedance Probability (AEP)** and **return period** of **`r flood_value` m^3^/s** flood for different probability distributions.
+
+
+```{r AEP_given_Q}
+
+#find return period/AEP given a flood value
+dist_lf_all <- c("ln3", "pe3", "wei", "gev", "gum", "glo", "nor", "lpe3")
+
+Calc_prob <- c(
+  cdfln3(flood_value, para= q.evfit.fxd.param$ln3),
+  cdfpe3(flood_value, para= q.evfit.fxd.param$pe3),
+  cdfwei(flood_value, para= q.evfit.fxd.param$wei),
+  cdf_ev(distribution = "gev", x = flood_value, para = q.evfit.fxd.param$gev),
+  cdf_ev(distribution = "gum", x = flood_value, para = q.evfit.fxd.param$gum),
+  cdfglo(flood_value, para= q.evfit.fxd.param$glo),
+  cdfnor(flood_value, para= q.evfit.fxd.param$nor),
+  plpearsonIII(flood_value, parLPE3[["mu"]], parLPE3[["sigma"]], parLPE3[["gamma"]])
+)
+
+AEP_flood <- data.frame(flood_value, dist_lf_all, (1-Calc_prob)*100)
+names(AEP_flood) <- c("Flood", "Dist", "AEP")
+
+AEP_flood <- AEP_flood %>% 
+  mutate(RetPeriod = 1/AEP*100) %>% 
+  mutate_at(vars(AEP), ~ round(., 2)) %>% 
+  mutate_at(vars(RetPeriod), ~ round(., 0))
+
+#replace distribution names
+AEP_flood2 <- AEP_flood %>% 
+  mutate(Distribution = Dist)
+AEP_flood2 <- AEP_flood2 %>% 
+  mutate(Distribution = replace(Distribution, Dist == "pe3", "Pearson Type III"),
+         Distribution = replace(Distribution, Dist == "lpe3", "Log Pearson III"),
+         Distribution = replace(Distribution, Dist == "nor", "Normal - LM"),
+         Distribution = replace(Distribution, Dist == "ln3", "Lognormal"),
+         Distribution = replace(Distribution, Dist == "gum", "Gumbel (EV I - max) - LM"),
+         Distribution = replace(Distribution, Dist == "gev", "GEV (max) - LM"),
+         Distribution = replace(Distribution, Dist == "wei", "Weibull (EV III) - LM"),
+         Distribution = replace(Distribution, Dist == "glo", "GLO"))
+
+AEP_flood3 <- AEP_flood2[,c(1,5,3,4)]
+
+#interactive
+reactable(AEP_flood3, 
+          highlight = TRUE, striped = TRUE,
+          columns = list(Flood = colDef(name = "Flood value (m^3/s)"),
+                         Distribution = colDef(name = "Distribution", align = "left"),
+                         AEP = colDef(name = "AEP (%)", align = "right", format = colFormat(digits = 2)),
+                         RetPeriod = colDef(name = "Return Period (year)")))
+
+```
+
+
+```{r Excel_export}
+
+###########################
+#summary page
+input_param <- c(
+  'Station number',
+  'Station name', 
+  'Length of record (year)'
+  )
+
+input_value <- c(station_no,
+                 station_name,
+                 year_w_data)
+input_page <- data.frame(cbind(input_param, input_value))
+
+
+#list all dataframe
+list_worksheet <- list("Input" = input_page,
+                       "Prob" = Q_pp)
+
+
+# Create a blank workbook
+wb <- createWorkbook(creator = "Water Resources Unit, NAHRIM", title = version_no)
+
+# Loop through the list of split tables as well as their names
+#   and add each one as a sheet to the workbook
+Map(function(data, name){
+  addWorksheet(wb, name)
+  writeData(wb, name, data)
+}, list_worksheet, names(list_worksheet))
+
+
+
+
+###########################
+#insert data frames
+
+
+#input flow data
+writeData(wb, "Input", flowdata[c(1,2)], 
+          startRow = 9, startCol = 1)
+writeData(wb, "Input", "Flood Frequency Analysis 1.0", 
+          startRow = 1, startCol = 1)
+deleteData(wb, "Input", cols = 2, rows = 1, gridExpand = TRUE)
+
+
+
+#Results
+addWorksheet(wb, "Result")
+writeData(wb, "Result", "Comparison of RMSE for all distributions", 
+          startRow = 1, startCol = 1)
+writeData(wb, "Result", rmse_all, 
+          startRow = 2, startCol = 1)
+writeData(wb, "Result", "Distributions", 
+          startRow = 2, startCol = 1)
+
+col_names <- c("Return Period (year)", "AEP (%)",
+               "Lognormal", "Pearson Type III", "Weibull (EV III) - LM",
+                "GEV (max) - LM", "Gumbel (EV I - max) - LM", "GLO", "Normal - LM", "Log Pearson III")
+qT.evfit.fxd4 <- qT.evfit.fxd3
+colnames(qT.evfit.fxd4) <- col_names
+
+writeData(wb, "Result", "Quantile estimation", 
+          startRow = 13, startCol = 1)
+writeData(wb, "Result", qT.evfit.fxd4, 
+          startRow = 14, startCol = 1)
+
+
+
+#Flood
+addWorksheet(wb, "Flood")
+writeData(wb, "Flood", "AEP and Return Period for given flood", 
+          startRow = 1, startCol = 1)
+writeData(wb, "Flood", AEP_flood3, 
+          startRow = 2, startCol = 1)
+writeData(wb, "Flood", "Flood (m^3/s)", 
+          startRow = 2, startCol = 1)
+writeData(wb, "Flood", "AEP (%)", 
+          startRow = 2, startCol = 3)
+writeData(wb, "Flood", "Return period (year)", 
+          startRow = 2, startCol = 4)
+
+
+# formatting
+##  create styles
+###  title
+title_style <- createStyle(fontName = "Tahoma", fontSize = 20, fontColour = "navyblue",
+                           textDecoration = "bold")
+addStyle(wb, "Input", style = title_style, rows = 1, cols = 1, stack = T)
+### heading 1
+head1_style <- createStyle(fontName = "Calibri", fontSize = 14, fontColour = "navyblue",
+                           textDecoration = "bold")
+addStyle(wb, "Result", style = head1_style, rows = 1, cols = 1, stack = T)
+addStyle(wb, "Result", style = head1_style, rows = 13, cols = 1, stack = T)
+addStyle(wb, "Flood", style = head1_style, rows = 1, cols = 1, stack = T)
+
+### number and table border formatting
+s_table <- createStyle(numFmt = "#,##0.0", border= "TopBottomLeftRight", borderColour = "gray48")
+addStyle(wb, "Result", style = s_table, rows = 2:10, cols = 1:2, gridExpand = TRUE)
+addStyle(wb, "Result", style = s_table, rows = 14:21, cols = 3:10, gridExpand = TRUE)
+addStyle(wb, "Flood", style = s_table, rows = 2:10, cols = 1:4, gridExpand = TRUE)
+s_table_AEP <- createStyle(numFmt = "0.00", border= "TopBottomLeftRight", borderColour = "gray48")
+addStyle(wb, "Flood", style = s_table_AEP, rows = 2:10, cols = 3, gridExpand = TRUE)
+s_table_RP <- createStyle(numFmt = "0", border= "TopBottomLeftRight", borderColour = "gray48")
+addStyle(wb, "Flood", style = s_table_RP, rows = 2:10, cols = 4, gridExpand = TRUE)
+s_table_text <- createStyle(border= "TopBottomLeftRight", borderColour = "gray48")
+addStyle(wb, "Result", style = s_table_text, rows = 14:21, cols = 1:2, gridExpand = TRUE)
+
+### word wrap
+s_wrap <- createStyle(wrapText = T)
+addStyle(wb, "Result", style = s_wrap, rows = 14, cols = 3:10, stack = T)
+addStyle(wb, "Flood", style = s_wrap, rows = 2, cols = 1:4, stack = T)
+
+
+#insert image
+insertImage(wb, "Result", paste0(new_dir, "/", filename2, "_flood_freq_log.jpg"),  
+            width = 7.52, height = 4.56, 
+            startRow = 25, startCol = 1, units = "in")
+insertImage(wb, "Result", paste0(new_dir, "/", filename2, "_flood_freq.jpg"),  
+            width = 7.52, height = 4.56, 
+            startRow = 25, startCol = 9, units = "in")
+insertImage(wb, "Result", paste0(new_dir, "/", filename2, "_QQplot.jpg"),  
+            width = 7.52, height = 4.56, 
+            startRow = 50, startCol = 1, units = "in")
+
+
+## set col widths
+setColWidths(wb, "Input", cols = 1:2, widths = 20)
+setColWidths(wb, "Result", cols = 1, widths = 25)
+setColWidths(wb, "Flood", cols = 2, widths = 25)
+
+
+###########################
+
+# Save workbook to working directory
+saveWorkbook(wb, file = paste0(new_dir, "/", filename2, "_flood_frequency.xlsx"), 
+             overwrite = TRUE)
+
+```
+
+
+
+# References
